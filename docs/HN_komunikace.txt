@@ -1,17 +1,23 @@
 ATTINY <=> ESP
+
 Po načtení 32 hlasů P nebo N (případně jednou za 24 hodin) je aktivováno ESP
 > Power on
+
 ESP potvrzuje signálem RTS, že je plně neběhlé a  připraveno přjímat data
 < RTS
+
 ATTINY odesíla data v domluveném formatu (specifikace níže)
 > Data
+
 ESP potvrzuje příjem a správnost DATA (data v pořádku OK, data poškozena dle kontrolního součtu RN)
 < OK / RN
 ESP odesílá data pomocí protokolu HTTP
 ESP => HTTP
 ESP potvrzuje ATTINY odeslání dat po HTTP
+
 < Data sent
 ATTINY deaktivuje ESP
+
 > Power off
 
 Formát dat:
@@ -19,3 +25,5 @@ H<počet pozitivních hlasů>N<počet negativních hlasů>*<součet všech hlas�
 
 Příklad:
 H32N11*43#10
+
+Vysvětlení příkladu hlasovalo 32 pro 11 proti, kontrolní součet (opravdu součet) je 43, výsledek modulu 11 je 10
