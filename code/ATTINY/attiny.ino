@@ -1,123 +1,193 @@
+/*H || !H @A[0], A[1]*/
+
+/*
+Attiny pouze loguje stisky tlačítka a přidává k nim timestamp
+- čas od posledního odeslání v millis
+
+data se ukládají ve formátu [cyklus][parita][H||!H][timestamp o 13 bitech]
+
+pro náladu platí: Happy => 1, Not happy => 0
+
+Data odesílá buď jednou za 24 hodin, nebo před zaplněním všech 256 bytů
+- nejlépe po n-minutové pauze, kdy je attiny v klidu a žádné tlačítko nebylo stisknuto
+*/
+
 #include <EEPROM.h>
 #include <SoftwareSerial.h>
 
-#define tl_1 1
-#define tl_2 2
+// Piny
+#define switchHappy 1
+#define switchNotHappy 2
 #define RX 3
 #define TX 4
 #define ESP 0
-#define potreba_pro_odeslani 32
-int adresa = 0;
-bool zapis_mod = true;
-int h = 0;
-int h2 = 0;
-int i = 0;
-bool tlstav_1 = false;
-bool tlstav_2 = false;
-char data[3];
-SoftwareSerial sSerial(RX,TX);
 
-void setup() {
-  pinMode(tl_1, INPUT);
-  pinMode(tl_2, INPUT);
+// Interní hodnoty
+#define attinyMemory 512
+#define sendAfterTime 24 * 3600 * 1000 // 24 hodin
+#define communicationErrorsAllowed 15
+#define sendDelay 1000
+
+// Signály pro komunikaci
+#define ready 'R'
+#define okay 'O'
+
+int lastWrittenAddress;
+int lastSendTime;
+
+int dataBreakpoint;            // Pojistka proti současnému zápisu do paměti a odesílání dat
+#define dataBreakpointConst 20 // Velikost předstihu paměti pro pojistku
+
+SoftwareSerial softSerial(RX, TX);
+
+void setup()
+{
+  // nastavení pinů
+  pinMode(switchHappy, INPUT);
+  pinMode(switchNotHappy, INPUT);
   pinMode(ESP, OUTPUT);
-  digitalWrite(ESP, LOW);
-  sSerial.begin(9600);
-  zjisteni_adresy();
-}
-void zjisteni_adresy() { //efektivně zjistí adresu na kterou má zapisovat
-  sSerial.print("\nstart");
-  h = EEPROM.read(511);
-  zapis_mod = ((~h) & 128);
-  sSerial.print(h, BIN);
-  sSerial.print(zapis_mod, BIN);
-  sSerial.print("\n");
-  i = 8;
-  adresa = 0;
-  while(i > 0){
-      if(zapis_mod == (128 & EEPROM.read(adresa | (1 << i)))) {
-        adresa = adresa | (1 << i);
-      }
-      sSerial.print(adresa, BIN);
-      sSerial.print(i, DEC);
-    i--;
-  }
-  adresa = adresa + 2;
-  if(zapis_mod != (128 & EEPROM.read(0))) {
-    adresa = 0;
-  }
-  sSerial.print("\n");
-  sSerial.print(adresa, DEC);
-  sSerial.print(EEPROM.read(adresa), BIN);
-  
+
+  digitalWrite(ESP, LOW); // Vypnutí ESP
+  softSerial.begin(9600);
+  lastWrittenAddress = FindLastBlock(); // Zjištění adresy k zápisu
+  SendData();
 }
 
-void loop() {
-  if ((digitalRead(tl_1) == LOW) != tlstav_1) {
-    tlstav_1 = !tlstav_1;
-    if (tlstav_1 == true) {//volá se jednou při zmáčknutí tlačítka
-      h = (EEPROM.read(adresa) & 127);
-      h = h + 1;
-      if(h < potreba_pro_odeslani){ //podmínka zda se má počet zmáčknutí odeslat
-      EEPROM.update(adresa, (h & 127) | (zapis_mod ^ 128));//uložení, ještě se neodesílá
-      } else {
-        odeslani(h - (potreba_pro_odeslani-1), 0);//odeslání
-      }
-    }
-  }
-  if ((digitalRead(tl_2) == LOW) != tlstav_2) {
-    tlstav_2 = !tlstav_2;
-    if (tlstav_2 == true) {//volá se jednou při zmáčknutí tlačítka
-      h2 = (EEPROM.read(adresa | 1) & 127);
-      h2 = h2 + 1;
-      if(h2 < potreba_pro_odeslani){ //podmínka zda se má počet zmáčknutí odeslat
-      EEPROM.update(adresa | 1, (h2 & 127) | (zapis_mod ^ 128));//uložení, ještě se neodesílá
-      } else {
-        odeslani(0, h2 - (potreba_pro_odeslani-1));//odeslání
-      }
-      
-    }
-  }
+void loop()
+{
+  HandleInput(switchHappy, 1);
+  HandleInput(switchNotHappy, 0);
 
+  // Odesílání dat před naplněním paměti - zabránění overflow při současném zápisu a odesílání
+  if (lastWrittenAddress == dataBreakpoint)
+    PrepareTransmission();
 
+  // Odesílání dat po 24 hodinách
+  if (millis() - lastSendTime > sendAfterTime)
+    PrepareTransmission();
 }
 
-void odeslani(byte plus1, byte plus2) {
-  h = (EEPROM.read(adresa) & 127) + plus1;
-  h2 = (EEPROM.read(adresa | 1) & 127) + plus2;
-  //odeslani
-  digitalWrite(ESP, HIGH);
-  while (!(data[0]=="R" && data[1]=="T" && data[2]=="S")){
-    if(sSerial.available()){
-      data[2] = data[1];
-      data[1] = data[0];
-      data[0] = sSerial.read();
+//
+int FindLastBlock()
+{
+  int currentlySearchingOnMin = 0;
+  int currentlySearchingOnMax = attinyMemory / 2 - 1;
+  int memoryMiddle;
+  int currentValue;
+  bool foundLastByte;
+
+  int searchBit = EEPROM.read(0) & (1 << 7);
+
+  while (!foundLastByte)
+  {
+    memoryMiddle = (currentlySearchingOnMin + currentlySearchingOnMax) / 2;
+
+    currentValue = EEPROM.read(memoryMiddle * 2);
+
+    if ((currentValue & (1 << 7)) == searchBit)
+    {
+      currentlySearchingOnMin = memoryMiddle;
     }
+    else
+    {
+      currentlySearchingOnMax = memoryMiddle;
+    }
+
+    if (currentlySearchingOnMin == currentlySearchingOnMax)
+      foundLastByte = true;
   }
-odeslani_dat:
-  sSerial.print('H');
-  sSerial.print(h);
-  sSerial.print('N');
-  sSerial.print(h2);
-  sSerial.print('*');
-  sSerial.print(h + h2);
-  sSerial.print('#');
-  sSerial.print((h + h2)%11);
-  sSerial.println();
-  while (true){
-    if(sSerial.available()){
-      data[1] = data[0];
-      data[0] = sSerial.read();
-    }
-    if(data[0]=="O" && data[1]=="K"){
-      break;
-    }
-    if(data[0]=="R" && data[1]=="N"){
-      goto odeslani_dat;
-    }
+  return currentlySearchingOnMax;
+}
+
+void HandleInput(int switchPin, int mood)
+{
+  if (digitalRead(switchPin) == LOW)
+  {
+    WriteData(mood);
   }
-  
-  EEPROM.update(adresa,(h & 127) | zapis_mod);
-  EEPROM.update(adresa | 1,(h2 & 127) | zapis_mod);
-  zjisteni_adresy();
+}
+
+void WriteData(int mood)
+{
+  int lastWrittenData = EEPROM.read(lastWrittenAddress); // Načtení posledních dat kvůli znaménku cyklu
+  int thisLogTimestamp = millis() - lastSendTime;
+  int parity = 0;
+
+  //[cyklus][parita][H||!H][timestamp o 13 bitech]
+
+  int dataLog = thisLogTimestamp | (mood << 13) | parity | (lastWrittenData & (1 << 15)); // Parita je zde nulová
+
+  parity = CheckParity(dataLog);
+
+  dataLog = thisLogTimestamp | (mood << 13) | (parity << 14) | (lastWrittenData & (1 << 15)); // Přidání potenciálně nenulové hodnoty parity
+
+  int nextAddress = (lastWrittenAddress + 2) % attinyMemory;
+
+  if (nextAddress == 0)
+    dataLog ^= (1 << 7);
+
+  EEPROM.write(nextAddress, dataLog >> 8);
+  EEPROM.write(nextAddress + 1, dataLog);
+
+  lastWrittenAddress = nextAddress;
+}
+
+int CheckParity(int log)
+{
+  log ^= log >> 8;
+  log ^= log >> 4;
+  log ^= log >> 2;
+  log ^= log >> 1;
+  return (~log) & 1;
+}
+
+void SendData()
+{
+  for (int address = 0; address < attinyMemory; address += 2)
+  {
+    softSerial.print(EEPROM.read(address));
+    softSerial.print(EEPROM.read(address + 1));
+    softSerial.println();
+  }
+}
+
+void PrepareTransmission()
+{
+  /*
+  Signály pro komunikaci s ESP:
+  R => ready
+  O => data přijata v pořádku
+  N => problém na lince, poslat data znovu
+  */
+
+  bool dataSent = false;
+  int communicationErrors = 0;
+
+  while (!dataSent) // Odesílání dat, dokud ESP nepotvrdí přijetí
+  {
+    digitalWrite(ESP, HIGH); // Zapnutí ESP
+
+    if (softSerial.available()) // Je dostupná komunikace s ESP
+    {
+      if (softSerial.read() == ready) // ESP je připraveno přijímat
+      {
+        SendData();
+
+        if (softSerial.read() == okay) // Ověření úspěšného odeslání a přijetí
+        {
+          dataSent = true;
+          dataBreakpoint = (lastWrittenAddress + dataBreakpointConst) % attinyMemory;
+        }
+        digitalWrite(ESP, LOW); // Vypnutí ESP
+        delay(sendDelay);
+      }
+    }
+    else
+      communicationErrors++;
+
+    if (communicationErrors >= communicationErrorsAllowed)
+      delay(10 * 60 * 1000);
+  }
+
+  lastSendTime = millis();
 }
