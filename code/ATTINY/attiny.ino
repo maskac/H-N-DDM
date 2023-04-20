@@ -114,17 +114,14 @@ void WriteData(int mood)
   int parity = 0;
 
   //[cyklus][parita][H||!H][timestamp o 13 bitech]
-
-  int dataLog = thisLogTimestamp | (mood << 13) | parity | (lastWrittenData & (1 << 15)); // Parita je zde nulová
-
+  int dataLog = thisLogTimestamp | (mood << 13) | (lastWrittenData & (1 << 15));
   parity = CheckParity(dataLog);
-
-  dataLog = thisLogTimestamp | (mood << 13) | (parity << 14) | (lastWrittenData & (1 << 15)); // Přidání potenciálně nenulové hodnoty parity
+  dataLog |= (parity << 14);
 
   int nextAddress = (lastWrittenAddress + 2) % attinyMemory;
 
   if (nextAddress == 0)
-    dataLog ^= (1 << 7);
+    dataLog ^= (1 << 15);
 
   EEPROM.write(nextAddress, dataLog >> 8);
   EEPROM.write(nextAddress + 1, dataLog);
@@ -145,8 +142,8 @@ void SendData()
 {
   for (int address = 0; address < attinyMemory; address += 2)
   {
-    softSerial.print(EEPROM.read(address));
-    softSerial.print(EEPROM.read(address + 1));
+    int data = (EEPROM.read(address) << 8) | (EEPROM.read(address + 1) << 0);
+    softSerial.print(data);
     softSerial.println();
   }
 }
@@ -166,7 +163,7 @@ void PrepareTransmission()
   while (!dataSent) // Odesílání dat, dokud ESP nepotvrdí přijetí
   {
     digitalWrite(ESP, HIGH); // Zapnutí ESP
-
+    delay(100);
     if (softSerial.available()) // Je dostupná komunikace s ESP
     {
       if (softSerial.read() == ready) // ESP je připraveno přijímat
